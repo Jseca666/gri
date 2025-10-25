@@ -93,7 +93,7 @@ def main():
     # 绑定实例，指定风险指标（与定价一致，比如 SRI/gamma=0.5）
     rmp.attach_instance(inst, rho_kind=getattr(params, "rho_kind", "SRI"), gamma=getattr(params, "gamma", 0.5))
     rmp.seed_identity_columns(inst, params)  # 真正把 0->i->0 的恒等列灌进去
-    print(f"[seed] added {inst.n_customers} identity columns")
+
 
     for it in range(1, params.max_iters + 1):
         # 1) 解 LP（拿 u 与 y）
