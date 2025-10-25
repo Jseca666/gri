@@ -1,156 +1,191 @@
 # gri/label/forward_ls.py
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Tuple, Dict, Iterable
 import numpy as np
-from gri.indices.gri_bisect import sri_rho
-from gri.master.duals import DualPack
+
+from gri.indices.rho_unified import rho_of_node
+
+@dataclass
+class SR3IConstraint:
+    T: Tuple[int, ...]   # 顶点子集（客户索引，从 0..n-1）
+    phi: float           # 对偶 φ_T
+
+@dataclass
+class DualPack:
+    # 覆盖约束对偶 u_i，预算对偶 v（若未建预算行则 =0）
+    u: List[float]
+    v: float
+    # 2PI/CI 的弧级对偶贡献 π_ij = sum_{S:(i,j)∈δ+(S)}(π_S + η_S)
+    pi_arc: Dict[Tuple[int, int], float]
+    # SR3I 列表
+    sr3i: List[SR3IConstraint]
+    # ρ 选择与参数
+    rho_kind: str = "SRI"
+    gamma: float = 0.5
+
+@dataclass
+class ParamsForPricing:
+    kmax: int = 5          # 最大扩展深度（或交付用的 beam/宽搜层数）
+    topk: int = 30         # 每层保留的标签上限（简单 beam 控制）
+    rc_eps: float = -1e-9  # 负减价阈值
+    # 其它调参：是否检查容量/时间窗等，默认 True
+    check_time: bool = True
+    check_capacity: bool = True
 
 @dataclass
 class Label:
-    node: int
-    visited_bits: int
-    route: List[int]
-    tau_mu: float
-    tau_omega: np.ndarray
-    zeta: float
-    det_cost: float
-    load: float
-    # SR3I 奇偶资源（与 DualPack.sr3_sets 对齐；0=偶，1=奇）
-    sr3_parity: np.ndarray
+    i: int                        # 当前末端顶点
+    X: Tuple[int, ...]            # 已访问客户序列（用于去环/简易主导）
+    cost: float                   # 累计行驶成本（用于预算项 v·cost）
+    rc: float                     # 当前减价
+    w: float                      # 当前载重
+    tau_mu: float                 # 均值条件下的最早开始时间 τ(μ)
+    zeta: float                   # 已累计的 ρ
+    tau_omega: np.ndarray         # 逐样本的最早开始时间 {τ(ω)}
+    H: np.ndarray                 # SR3I 二元资源（|C| 维 0/1）
+    route_seq: Tuple[int, ...]    # 记录路径，生成列时用
 
-def _bit(i: int) -> int: return 1 << i
-def _not_visited(bits: int, j: int) -> bool: return (bits & _bit(j)) == 0
+def _init_label(inst, duals: DualPack) -> Label:
+    n = inst.n_customers
+    return Label(
+        i=-1, X=tuple(), cost=0.0,
+        rc= -sum(duals.u),    # 起点 rc 初始化为 -∑ u_i（便于把“覆盖对偶”抵消到每个新增 j）
+        w=0.0,
+        tau_mu=0.0,
+        zeta=0.0,
+        tau_omega=np.zeros(inst.N, dtype=np.float64),
+        H=np.zeros(len(duals.sr3i), dtype=np.int8),
+        route_seq=tuple()
+    )
+
+def _pi_arc(duals: DualPack, i: int, j: int) -> float:
+    return duals.pi_arc.get((i, j), 0.0) if i >= 0 else duals.pi_arc.get(("dep", j), 0.0)
+
+def _extend(inst, duals: DualPack, L: Label, j: int) -> Label | None:
+    # 容量约束
+    if L.w + float(inst.q[j]) > float(inst.Q):
+        return None
+
+    # 均值时间窗可行性（用于剪枝）
+    travel_mu = float(inst.tt0[j]) if L.i < 0 else float(inst.tt[L.i, j])
+    tau_mu_next = max(float(inst.e[j]), L.tau_mu + (0.0 if L.i < 0 else float(inst.s[L.i])) + travel_mu)
+    if tau_mu_next > float(inst.l[j]):  # 均值下已迟到则剪（原文准则）
+        return None
+
+    # 样本到达时间 {τ(ω)} 更新
+    if L.i < 0:
+        # depot -> j
+        arr = L.tau_omega + inst.tt0[j] + inst.delay0[:, j]
+    else:
+        arr = L.tau_omega + inst.s[L.i] + inst.tt[L.i, j] + inst.delay[:, L.i, j]
+    tau_omega_next = np.maximum(arr, float(inst.e[j]))
+
+    # 单节点 ρ(ξ_j) 评估（经验分布）
+    rho_j = rho_of_node(tau_omega_next, float(inst.l[j]),
+                        kind=duals.rho_kind, gamma=duals.gamma)
+
+    # 成本 + 减价更新（式 (12a)）
+    # 基础行驶成本（若有预算对偶 v，会进入 rc）
+    travel_cost = travel_mu  # 这里用均值时长作为 cost；如你已有路成本 cr，可直接替换
+    cost_next = L.cost + travel_cost
+
+    # 覆盖对偶：新增 j 抵消 +u_j
+    u_term = -float(duals.u[j])
+
+    # 预算对偶：v * travel_cost
+    v_term = duals.v * travel_cost if duals.v else 0.0
+
+    # 2PI/CI 弧对偶：π_ij
+    pi_term = _pi_arc(duals, L.i, j)
+
+    # SR3I 二元资源：若当前某 κ 的 T(κ) 中包含 j 且 κ(L)=1，则 +φ(κ)
+    sr3i_term = 0.0
+    H_next = L.H.copy()
+    for idx, c in enumerate(duals.sr3i):
+        if j in c.T:
+            if H_next[idx] == 1:
+                sr3i_term += c.phi
+            # (12b) 翻转
+            H_next[idx] = (H_next[idx] + 1) & 1
+
+    rc_next = L.rc + rho_j + u_term + v_term - pi_term + sr3i_term
+
+    return Label(
+        i=j,
+        X=L.X + (j,),
+        cost=cost_next,
+        rc=rc_next,
+        w=L.w + float(inst.q[j]),
+        tau_mu=tau_mu_next,
+        zeta=L.zeta + rho_j,
+        tau_omega=tau_omega_next,
+        H=H_next,
+        route_seq=L.route_seq + (j,)
+    )
 
 def _dominates(a: Label, b: Label) -> bool:
-    return (a.zeta <= b.zeta and a.tau_mu <= b.tau_mu and a.det_cost <= b.det_cost and a.load <= b.load) and \
-           (a.zeta < b.zeta or a.tau_mu < b.tau_mu or a.det_cost < b.det_cost or a.load < b.load)
+    # 轻量主导（同尾节点且访问集一致/包含时才比较）
+    return (a.i == b.i and set(a.X).issubset(b.X)
+            and a.w <= b.w + 1e-9
+            and a.tau_mu <= b.tau_mu + 1e-9
+            and a.zeta <= b.zeta + 1e-9
+            and a.rc <= b.rc + 1e-12)
 
-def _pareto_prune(labels: List[Label], cap: int) -> List[Label]:
-    pruned: List[Label] = []
+def _prune(labels: List[Label]) -> List[Label]:
+    # 简单 O(K^2) 主导筛，K 不大（用在 beam 限制后）
+    kept: List[Label] = []
     for L in labels:
-        dominated = False; to_remove = []
-        for P in pruned:
-            if _dominates(P, L): dominated = True; break
-            if _dominates(L, P): to_remove.append(P)
-        if dominated: continue
-        for R in to_remove: pruned.remove(R)
-        pruned.append(L)
-        if len(pruned) > cap:
-            pruned.sort(key=lambda x: (x.zeta, x.tau_mu, x.det_cost))
-            pruned = pruned[:cap]
-    return pruned
+        dominated = False
+        for K in kept:
+            if _dominates(K, L):
+                dominated = True
+                break
+        if not dominated:
+            # 反向再清掉被 L 支配的
+            kept = [K for K in kept if not _dominates(L, K)]
+            kept.append(L)
+    return kept
 
-def pricing_forward(instance, duals: DualPack, params) -> List[Dict]:
+def find_negative_rc_routes(inst, duals: DualPack, params: ParamsForPricing) -> List[dict]:
     """
-    reduced cost 按论文式(11)+(12a)(12b)：
-      c' = c + ρ_j  − u_j  − v * d_ij  − π_ij  − Σ_{κ: parity=1 ∧ j∈T(κ)} φ_T(κ)
-    其中 v 是预算约束(3d)的对偶，π_ij 汇聚了 2PI/CI 的对偶。SR3I 用“奇偶资源”切换，见(12b)。
+    前向标签定价：返回负减价列（若有），列结构: dict(cost, rows, route_seq, vals, ub)
+    - rows: 覆盖到的客户索引列表
+    - vals: 与 rows 对应的系数（1）
     """
-    n, N, depot = instance.n_customers, instance.N, instance.n_customers
-    eps_det = float(getattr(params, "det_eps", 1e-3))
-    eps_ret = float(getattr(params, "ret_eps", 1e-3))
-    KMAX = int(getattr(params, "kmax", 4))
-    gamma = float(getattr(params, "gamma", 0.5))
-    pareto_cap = int(getattr(params, "pareto_cap", 16))
-    tol = 1e-12
+    # 初始化
+    beams: List[Label] = [_init_label(inst, duals)]
+    best_cols: List[dict] = []
 
-    Q = float(getattr(instance, "Q", 1e18))
-    q = getattr(instance, "q", np.zeros(n, dtype=np.float64))
-    s = getattr(instance, "s", np.zeros(n, dtype=np.float64))
+    for depth in range(params.kmax):
+        new_beams: List[Label] = []
+        # 逐标签扩展
+        for L in beams:
+            # 枚举未访问客户
+            cand = [j for j in range(inst.n_customers) if j not in L.X]
+            for j in cand:
+                Lj = _extend(inst, duals, L, j)
+                if Lj is None:
+                    continue
+                new_beams.append(Lj)
+                # 生成一条“返回仓库”的完整路试探（可按需要检查回仓均值时窗）
+                rc_with_back = Lj.rc  # 回仓项可并入 travel_cost + v*…，此处略去
+                if rc_with_back < params.rc_eps:
+                    best_cols.append({
+                        "cost": Lj.cost,
+                        "rows": list(Lj.X),
+                        "route_seq": list(Lj.route_seq),
+                        "vals": [1.0] * len(Lj.X),
+                        "ub": 1.0
+                    })
+        if not new_beams:
+            break
+        # 主导 + beam 限制
+        new_beams = _prune(new_beams)
+        # 取 rc 最小的 topk
+        new_beams.sort(key=lambda x: x.rc)
+        beams = new_beams[:params.topk]
 
-    m_sr3 = len(duals.sr3_sets)
-    init = Label(
-        node=depot, visited_bits=0, route=[],
-        tau_mu=0.0, tau_omega=np.zeros(N, dtype=np.float64),
-        zeta=0.0, det_cost=0.0, load=0.0,
-        sr3_parity=np.zeros(m_sr3, dtype=np.int8)
-    )
-    frontier = [init]
-    candidates: List[Tuple[float, Dict]] = []
+    return best_cols
 
-    for depth in range(1, KMAX + 1):
-        buckets: Dict[Tuple[int, int], List[Label]] = {}
-        for L in frontier:
-            for j in range(n):
-                if not _not_visited(L.visited_bits, j): continue
-                if L.load + float(q[j]) > Q + 1e-12: continue
 
-                # 到达
-                if L.node == depot:
-                    d_ij = float(instance.tt0[j])
-                    arr_mu = L.tau_mu + d_ij
-                    arr_om = L.tau_omega + instance.delay0[:, j]
-                    det_new = L.det_cost + d_ij
-                    prev = depot
-                else:
-                    d_ij = float(instance.tt[L.node, j])
-                    arr_mu = L.tau_mu + d_ij
-                    arr_om = L.tau_omega + instance.delay[:, L.node, j]
-                    det_new = L.det_cost + d_ij
-                    prev = L.node
-
-                # 等待 + 服务
-                e_j = float(instance.e[j])
-                start_mu = arr_mu if arr_mu >= e_j else e_j
-                start_om = np.maximum(arr_om, e_j)
-                tau_mu_new = start_mu + float(s[j])
-                tau_omega_new = start_om + float(s[j])
-
-                # 风险：SRI
-                l_j = float(instance.l[j]); scale = float(max(instance.scale[j], 1e-6))
-                xi = (tau_omega_new - l_j) / scale
-                rho_j = sri_rho(xi, gamma, tol=getattr(params, "bisect_tol", 1e-3))
-
-                zeta_new = L.zeta + rho_j
-                bits_new = L.visited_bits | _bit(j)
-                route_new = L.route + [j]
-                load_new  = L.load + float(q[j])
-
-                # SR3I φ：按(12b)触发（先用扩展前的奇偶）
-                phi_sr3 = duals.sr3_phi_if_trigger(L.sr3_parity, j)
-                parity_new = L.sr3_parity.copy()
-                for idx, T in enumerate(duals.sr3_sets):
-                    if j in T:
-                        parity_new[idx] = (parity_new[idx] + 1) & 1  # mod 2
-
-                # 列成本（风控目标 + 极小确定性权重 + 回仓微惩罚）
-                ret_cost = float(instance.tt_back[j])
-                cost = float(zeta_new + eps_det * det_new + eps_ret * ret_cost)
-
-                # 弧上的 cut 对偶（2PI/CI）
-                pi_ij = duals.arc_penalty(prev, j)
-                # 覆盖对偶之和
-                dual_u = float(sum(duals.u[i] for i in route_new))
-                # 预算对偶 v*d_ij
-                v_term = duals.v * d_ij
-
-                # 按(12a)得 rc
-                # 弧上的 cut 对偶
-                pi_ij = duals.arc_penalty(prev, j)
-                dual_u = float(sum(duals.u[i] for i in route_new))
-                v_term = duals.v * d_ij
-                # ——注意 SR3I：应“+ φ”而不是减 ——（φ≤0）
-                phi_sr3 = duals.sr3_phi_if_trigger(L.sr3_parity, j)
-
-                rc = cost - dual_u - v_term - pi_ij + phi_sr3  # ← 关键改动
-
-                # 返回列时带上 route_seq，便于 RMP 后续给新割补系数
-                if rc < -tol and len(route_new) >= 2:
-                    candidates.append((rc, {
-                        "rows": route_new, "route_seq": route_new,
-                        "vals": [1.0] * len(route_new), "ub": 1.0, "cost": cost
-                    }))
-                lab_new = Label(
-                    node=j, visited_bits=bits_new, route=route_new,
-                    tau_mu=tau_mu_new, tau_omega=tau_omega_new,
-                    zeta=zeta_new, det_cost=det_new, load=load_new,
-                    sr3_parity=parity_new
-                )
-                buckets.setdefault((lab_new.node, lab_new.visited_bits), []).append(lab_new)
-
-        frontier = [L for labs in buckets.values() for L in _pareto_prune(labs, pareto_cap)]
-
-    if not candidates: return []
-    candidates.sort(key=lambda x: x[0])  # 最负优先
-    topk = int(getattr(params, "cols_topk", 12))
-    return [col for _, col in candidates[:topk]]

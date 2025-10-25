@@ -4,7 +4,7 @@ from gri.data.solomon import load_solomon_instance
 import os
 
 import numpy as np
-from gri.master.rmp_highs import RMP
+from gri.master.rmp_highs import RMP,_zeta_singleton
 from gri.pricing.reduced_cost import find_negative_rc_routes
 from gri.master.separate import separate_CI, separate_SR3I, separate_2PI_heur
 from gri.master.duals import DualPack
@@ -13,7 +13,7 @@ class Params:
     data_path: str = r"D:\PycharmProjects\gri-replication\gri\data\solomon\25\C108.txt"  # 按实际路径修改
     use_solomon: bool = True  # 切换开关
     n_cust: int = 25  # 取前 25 客户
-
+    rho_kind: str = "SRI"
     lp_time: float = 1.0
     mip_time: float = 10.0
     gap: float = 0.01
@@ -67,8 +67,18 @@ class ToyInstance:
             np.fill_diagonal(d_raw[w], 0.0)
         self.delay = (d_raw - d_raw.mean(axis=0, keepdims=True)).astype(np.float64)
 
-def seed_identity_columns(n: int):
-    return [{"cost": 1.0, "rows": [i], "vals": [1.0], "ub": 1.0} for i in range(n)]
+def _seed_identity_columns(self, inst, params):
+    added = 0
+    for i in range(1, inst.n_customers + 1):
+        zeta = _zeta_singleton(inst, i, params)
+        col_index = self.highs.addCol(
+            cost=zeta, lower=0.0, upper=1.0,
+            num_nz=1, indices=[self.row_of_cover[i-1]], values=[1.0]
+        )
+        self.col_zeta.append(zeta)
+        self.col_customers.append((i,))
+        added += 1
+    print(f"[seed] added {added} identity columns")
 
 def main():
     # inst = ToyInstance(n_customers=6, N=200, seed=2025)
@@ -90,8 +100,9 @@ def main():
         inst = ToyInstance(n_customers=6, N=200, seed=2025)
 
     rmp = RMP(n_customers=inst.n_customers)
-    rmp.add_columns([{"cost": 1.0, "rows": [i], "route_seq": [i], "vals": [1.0], "ub": 1.0}
-                     for i in range(inst.n_customers)])
+    # 绑定实例，指定风险指标（与定价一致，比如 SRI/gamma=0.5）
+    rmp.attach_instance(inst, rho_kind=getattr(params, "rho_kind", "SRI"), gamma=getattr(params, "gamma", 0.5))
+
     print(f"[seed] added {inst.n_customers} identity columns")
 
     for it in range(1, params.max_iters + 1):
@@ -124,5 +135,6 @@ def main():
 
     obj_mip, _ = rmp.to_integer_and_solve(mip_gap=params.gap, time_limit=params.mip_time)
     print(f"[MIP] obj={obj_mip:.4f}")
+
 if __name__ == "__main__":
     main()
