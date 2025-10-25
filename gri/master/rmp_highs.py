@@ -113,6 +113,9 @@ class RMP:
                 "cost": zeta, "rows": list(rows), "vals": list(vals), "ub": ub,
                 "route_seq": list(c.get("route_seq", []))
             })
+            meta = {"route_seq": list(c.get("route_seq", []))}
+            self.cols_meta.append(meta)
+            self.num_cols += 1
 
             # 如果当前模型已建好行，可以立即加列（行必须先存在）
             try:

@@ -19,6 +19,8 @@ class Params:
     gap: float = 0.01
     # 定价控制
     kmax: int = 4
+    rc_eps: float = -1e-6
+
     gamma: float = 0.5
     bisect_tol: float = 1e-3
     det_eps: float = 1e-3
@@ -67,18 +69,6 @@ class ToyInstance:
             np.fill_diagonal(d_raw[w], 0.0)
         self.delay = (d_raw - d_raw.mean(axis=0, keepdims=True)).astype(np.float64)
 
-def _seed_identity_columns(self, inst, params):
-    added = 0
-    for i in range(1, inst.n_customers + 1):
-        zeta = _zeta_singleton(inst, i, params)
-        col_index = self.highs.addCol(
-            cost=zeta, lower=0.0, upper=1.0,
-            num_nz=1, indices=[self.row_of_cover[i-1]], values=[1.0]
-        )
-        self.col_zeta.append(zeta)
-        self.col_customers.append((i,))
-        added += 1
-    print(f"[seed] added {added} identity columns")
 
 def main():
     # inst = ToyInstance(n_customers=6, N=200, seed=2025)
@@ -102,7 +92,7 @@ def main():
     rmp = RMP(n_customers=inst.n_customers)
     # 绑定实例，指定风险指标（与定价一致，比如 SRI/gamma=0.5）
     rmp.attach_instance(inst, rho_kind=getattr(params, "rho_kind", "SRI"), gamma=getattr(params, "gamma", 0.5))
-
+    rmp.seed_identity_columns(inst, params)  # 真正把 0->i->0 的恒等列灌进去
     print(f"[seed] added {inst.n_customers} identity columns")
 
     for it in range(1, params.max_iters + 1):
