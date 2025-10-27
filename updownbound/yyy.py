@@ -31,50 +31,56 @@ def f_alpha(x, gamma, alpha):
 
 # ===== one-pass stats (CORRECT first breakpoint) =====
 def one_pass_stats(x):
+    """
+    单次扫描统计：
+      mu_plus  = E[(x)_+]
+      mu_minus = E[(-x)_+]
+      mu2_minus= E[(-x)_+^2]           <-- 新增：负幅二阶矩（无条件期望）
+      m        = mu_plus - mu_minus
+      p_ge0    = P(x >= 0)
+      L, U     = min(x), max(x)
+      delta    = min_{x_i<0} (-x_i)    (最近负幅；若无负样本则 +inf)
+      A        = -L                    (最远负幅)
+      n_neg    = # {x_i < 0}
+    """
     x = np.asarray(x, dtype=np.float64)
     n = x.size
-    mu_p = 0.0; mu_m = 0.0
+    mu_p = 0.0; mu_m = 0.0; mu2_m = 0.0
     cnt_ge0 = 0
-    cnt_gt0 = 0      # 新增：strict 正数个数
-    cnt_eq0 = 0      # 新增：恰为 0 的个数
     L = np.inf; U = -np.inf
     n_neg = 0
-    delta = np.inf
+    delta = np.inf  # 最近负幅（幅度最小的负值）
 
     for xi in x:
-        if xi > 0.0:
-            cnt_gt0 += 1                  # 记录 x>0
+        if xi >= 0.0:
             cnt_ge0 += 1
             mu_p += xi
-        elif xi == 0.0:
-            cnt_eq0 += 1                  # 记录 x==0
-            cnt_ge0 += 1
-            # mu_p += 0
         else:
-            mu_m += -xi
-            n_neg += 1
             amp = -xi
+            n_neg += 1
+            mu_m += amp
+            mu2_m += amp * amp          # <-- 新增：累加负幅平方
             if amp < delta:
                 delta = amp
         if xi < L: L = xi
         if xi > U: U = xi
 
-    mu_plus  = mu_p / n
-    mu_minus = mu_m / n
-    m        = mu_plus - mu_minus
-    p_ge0    = cnt_ge0 / n
-    p_gt0    = cnt_gt0 / n            # 新增：P(x>0)
-    p_eq0    = cnt_eq0 / n            # 新增：P(x=0)
-    A        = -L
+    mu_plus   = mu_p / n
+    mu_minus  = mu_m / n
+    mu2_minus = mu2_m / n              # <-- 新增：E[(-x)_+^2]
+    m         = mu_plus - mu_minus
+    p_ge0     = cnt_ge0 / n
+    A         = -L
 
+    # 容差修正：保证 delta ∈ [0, A]（或 +inf）
     if np.isfinite(delta):
-        if delta < -1e-15: delta = 0.0
+        if delta < -1e-15:
+            delta = 0.0
         if delta > A + 1e-12 * max(1.0, abs(A)):
             delta = A
 
-    return dict(mu_plus=mu_plus, mu_minus=mu_minus, m=m,
-                p_ge0=p_ge0, p_gt0=p_gt0, p_eq0=p_eq0,   # ← 把 p_gt0/p_eq0 带出去
-                L=L, U=U, A=A, n_neg=n_neg, delta=delta)
+    return dict(mu_plus=mu_plus, mu_minus=mu_minus, mu2_minus=mu2_minus,
+                m=m, p_ge0=p_ge0, L=L, U=U, A=A, n_neg=n_neg, delta=delta)
 
 # ===== LOWER bound (tolerant branching + strict shrink) =====
 def lower_bound_guaranteed(stats, gamma, x, rel=1e-12, abs_tol=1e-15):
@@ -126,43 +132,74 @@ def lower_bound_guaranteed(stats, gamma, x, rel=1e-12, abs_tol=1e-15):
         return float(lb), float(a1_ge0), "delta"
 # ===== UPPER bound (safe) =====
 def upper_bound_safe(stats, gamma, eps=1e-12):
-    mu_plus  = float(stats["mu_plus"])
-    mu_minus = float(stats["mu_minus"])
-    p_ge0    = float(stats["p_ge0"])
-    A        = float(stats["A"])
-    delta    = float(stats["delta"])
-    m        = float(stats.get("m", mu_plus - mu_minus))
+    mu_plus   = float(stats["mu_plus"])
+    mu_minus  = float(stats["mu_minus"])
+    mu2_minus = float(stats.get("mu2_minus", 0.0))
+    p_ge0     = float(stats["p_ge0"])
+    A         = float(stats["A"])
+    delta     = float(stats["delta"])
+    m         = float(stats.get("m", mu_plus - mu_minus))
 
     if m > 0.0:
         return float("inf")
 
     p_minus = max(0.0, 1.0 - p_ge0)
-    B = (mu_minus / p_minus) if p_minus > eps else 0.0  # 负幅度均值
     cands = []
 
-    # (0) 若 α=A 已可行，则 A 是上界
+    # (0) 若 α=A 已可行
     if (A > 0.0) and (m + (1.0 - gamma) * A <= eps):
         cands.append(A)
 
-    # (1) 旧的 cand1（落在 [0, A]）——保留
+    # (1) 旧候选（[0,A] 线段），保留
     if (A > 0.0) and (p_minus > eps) and (gamma > p_ge0 + eps):
         cand1 = max(mu_minus / p_minus, (mu_plus + mu_minus) / (gamma - p_ge0))
         if cand1 <= A + 1e-15:
             cands.append(cand1)
 
-    # (2) 新增：中段候选（δ..A），基于端点两点分布的最坏情形
+    # (2) 端点两点分布的中段候选（修正：带 α·p_ge0，且分母 γ - p_ge0 - p_- q）
     if (p_minus > eps) and np.isfinite(delta) and (delta < A - 1e-15):
+        B = mu_minus / p_minus
         denom = (A - delta)
         if denom > eps:
             q = (A - B) / denom
             q = min(max(q, 0.0), 1.0)
-            den_mid = gamma - p_minus * q
+            den_mid = gamma - p_ge0 - p_minus * q
+            num_mid = mu_plus - p_minus * q * delta
             if den_mid > eps:
-                alpha_mid = (mu_plus + p_minus * q * delta) / den_mid
+                alpha_mid = num_mid / den_mid
                 if alpha_mid >= delta - 1e-12:
                     cands.append(min(alpha_mid, A))
 
-    # (3) 最后一段候选（只有当根确实在最后一段时才采纳）
+    # (3) Cantelli 二阶矩中段候选（修正 g(α)：加上 α·p_ge0）
+    if (p_minus > eps) and np.isfinite(delta) and (delta < A - 1e-15):
+        B  = mu_minus / p_minus
+        B2 = mu2_minus / p_minus if mu2_minus > 0 else B*B
+        sigma2 = max(0.0, B2 - B*B)
+        L = max(delta, 0.0)
+        U = min(A, B - 1e-15)
+        if (sigma2 > eps) and (U > L + 1e-12):
+            def g(alpha):
+                t = B - alpha
+                frac = sigma2 / (sigma2 + t*t)
+                return mu_plus + alpha*p_ge0 + p_minus*(alpha - delta)*frac - gamma*alpha
+
+            gL = g(L); gU = g(U)
+            if gL <= 1e-12:
+                cands.append(L)
+            elif gU <= -1e-12:
+                a, b = L, U
+                fa, fb = gL, gU
+                for _ in range(50):
+                    mid = 0.5*(a+b)
+                    fm = g(mid)
+                    if abs(fm) <= 1e-12 or (b-a) <= 1e-12*max(1.0, abs(mid)):
+                        cands.append(mid); break
+                    if fa * fm <= 0.0:
+                        b, fb = mid, fm
+                    else:
+                        a, fa = mid, fm
+
+    # (4) 最后一段（≥A）
     if (1.0 - gamma) > eps:
         a_last = max(0.0, (-m) / (1.0 - gamma))
         if a_last + 1e-14 >= A:
@@ -170,7 +207,8 @@ def upper_bound_safe(stats, gamma, eps=1e-12):
 
     if not cands:
         return float("inf")
-    return float(max(0.0, min(cands)))
+    ub = float(max(0.0, min(cands)))
+    return ub
 
 # ===== Truth: closed-form (right-inclusive) + same-piece bisection =====
 def sri_closed_form_exact(x, gamma, eps=1e-14):
